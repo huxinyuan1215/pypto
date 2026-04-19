@@ -570,7 +570,10 @@ class JITFunction:
         # dynamic dims declared only in dep functions (not in entry).
         dynamic_dims = _propagate_dynamic_dims_from_deps(self._func, self._get_deps(), dynamic_dims)
 
-        # Build cache key (based on entry function's params only)
+        # Build cache key (based on entry function's params only).
+        # Platform is included so artifacts compiled for different targets
+        # never collide in the same cache.
+        platform = run_config.platform if run_config is not None else None
         key = make_cache_key(
             source_hash=self._get_source_hash(),
             param_names=param_names,
@@ -578,17 +581,24 @@ class JITFunction:
             tensor_dtypes={n: m.dtype for n, m in tensor_meta.items()},
             dynamic_dims=dynamic_dims,
             scalar_values=scalar_values,
+            platform=platform,
         )
 
         # L1 cache lookup
         if key not in self._cache:
-            self._cache[key] = self._compile(tensor_meta, scalar_values, scalar_dtypes, dynamic_dims, pl)
+            self._cache[key] = self._compile(
+                tensor_meta, scalar_values, scalar_dtypes, dynamic_dims, pl, platform=platform
+            )
 
-        # Execute the compiled kernel on device with the original arguments
+        # Execute the compiled kernel on device.
+        # Use bound.arguments (in signature order) so keyword-style calls
+        # like kernel(a=x, b=y) are routed correctly regardless of how the
+        # caller passed them.
         compiled = self._cache[key]
+        ordered_args = [arguments[n] for n in param_names if n in arguments]
         if run_config is not None:
-            return compiled(*args, config=run_config)
-        return compiled(*args)
+            return compiled(*ordered_args, config=run_config)
+        return compiled(*ordered_args)
 
     # ------------------------------------------------------------------
     # Compilation
@@ -601,11 +611,12 @@ class JITFunction:
         scalar_dtypes: dict[str, DataType],
         dynamic_dims: set[tuple[str, int]],
         pl: Any,
+        platform: str | None = None,
     ) -> Any:
         """Specialize entry + deps into @pl.program source, parse, and compile.
 
         Runs the full compilation pipeline: pass pipeline + codegen via
-        ``ir.compile(skip_ptoas=True)``.  Returns a ``CompiledProgram``
+        ``ir.compile()``.  Returns a ``CompiledProgram``
         containing the post-pass ``ir.Program`` and the generated output
         artifacts (orchestration C++, kernel MLIR).
         """
@@ -618,7 +629,7 @@ class JITFunction:
         source = Specializer(class_name, contexts, dynvar_bindings, dynvar_literals).specialize()
         parsed = pl.parse(source)
         skip_ptoas = not _ptoas_available()
-        return ir_compile(parsed, skip_ptoas=skip_ptoas)
+        return ir_compile(parsed, skip_ptoas=skip_ptoas, platform=platform)
 
     def _compile_to_program(
         self,
@@ -802,17 +813,24 @@ class JITFunction:
             tensor_dtypes={n: m.dtype for n, m in tensor_meta.items()},
             dynamic_dims=dynamic_dims,
             scalar_values=scalar_values,
+            platform=None,  # compile_for_test is platform-agnostic (testing only)
         )
 
-        # Populate cache via ir.compile() (codegen included).
-        # This may fail for single-function programs due to the
-        # OutlineIncoreScopes limitation — that is expected and the cache
-        # entry is left empty in that case.
+        # Populate cache via ir.compile() (codegen included) as a best-effort
+        # side effect.  Two known failure modes are both acceptable here:
+        #   (1) Single-function programs with incore scopes fail at
+        #       OutlineIncoreScopes (the pass only handles Opaque functions).
+        #   (2) Some programs fail at ptoas due to hardware-specific constraints
+        #       (e.g. tinsert loc=acc/mat mismatch on assemble kernels).
+        # In both cases the cache entry is simply left empty; the actual return
+        # value of this method comes from _compile_to_program() below, which
+        # runs only through the pass pipeline (no codegen) and always succeeds
+        # for structurally valid IR.
         if key not in self._cache:
             try:
                 self._cache[key] = self._compile(tensor_meta, scalar_values, scalar_dtypes, dynamic_dims, pl)
             except Exception:
-                pass  # codegen failure for single-function programs is expected
+                pass
 
         # Return the post-pass ir.Program via the lightweight path
         # (no codegen) for structural equality comparison.
